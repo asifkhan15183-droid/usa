@@ -6,6 +6,20 @@
 const HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
+<style>
+.adlabel {
+  display: none !important;
+}
+.adslot {
+  border: 0 !important;
+  background: transparent !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+}
+a[href*="arwf.org"] {
+  display: none !important;
+}
+</style>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#f4f8fc">
 <meta name="description" content="USA SPC — explore finance and crypto guides, play free mini-games, and learn through interactive challenges.">
