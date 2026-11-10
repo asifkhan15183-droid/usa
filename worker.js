@@ -9,7 +9,7 @@ const HTML = String.raw`<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#f4f8fc">
 <meta name="description" content="USA SPC — explore finance and crypto guides, play free mini-games, and learn through interactive challenges.">
-<title>USA SPC — Finance, Crypto & Play</title>
+<title>USA Finance — Finance, Crypto & Play</title>
 <style>
 :root{--ink:#14243a;--muted:#65758b;--blue:#1769e0;--blue2:#0d4eae;--green:#12a875;--line:#e5edf5;--bg:#f4f8fc;--card:#fff;--shadow:0 12px 34px rgba(26,58,98,.08)}
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer;border:0}button:focus-visible,a:focus-visible{outline:3px solid #8ab9ff;outline-offset:3px}.wrap{width:min(1120px,calc(100% - 32px));margin:auto}
