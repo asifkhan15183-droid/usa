@@ -1,4 +1,11 @@
-name = "usa"
+name = "earn-app"
 main = "worker.js"
-compatibility_date = "2026-11-10"
-workers_dev = true
+compatibility_date = "2025-01-01"
+
+[vars]
+ADMIN_EMAIL = "apnar@email.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "earn-db"
+database_id = "e81089fb-611d-478a-88de-2549fcc28875"
