@@ -1,154 +1,271 @@
-// USA SPC — Cloudflare Worker (single-file landing page)
-// Deploy: paste this file into a Cloudflare Worker and deploy.
-// No database or build step. Game progress and leaderboard are stored locally in each
-// visitor's browser (localStorage), so this version does not create a global leaderboard.
-
-const HTML = String.raw`<!doctype html>
-<html lang="en">
-<head>
-<style>
-.adlabel {
-  display: none !important;
+// =====================================================================
+// EARNING APP - standalone web app (no Telegram, no crypto, no mining)
+// Single-file Cloudflare Worker (frontend + backend) + D1 database
+// Binding: D1 "DB" | Variable: ADMIN_EMAIL (the email that gets the Admin tab)
+// Features: email login, farming, daily check-in, tasks (timer enforced on server),
+// referral bonus, withdraw by bKash / Nagad / PayPal (manual admin payout), admin panel
+// =====================================================================
+const DEF = { name: "EarnBD", cur: "৳", farm_h: 6, farm_r: 0.5, ci: "0.2,0.3,0.4,0.5,0.6,0.8,2", ref: 5, secs: 20, minw: 100, wd: 1, notice: "" };
+const NUM = ["farm_h", "farm_r", "ref", "secs", "minw", "wd"];
+const J = (d, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store" } });
+const r2 = n => Math.round(n * 100) / 100;
+const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
+const rnd = n => hex(crypto.getRandomValues(new Uint8Array(n)));
+const day = t => Math.floor((t + 216e5) / 864e5); // day number in Bangladesh time (UTC+6)
+const EM = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+async function hash(p, salt) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(p), "PBKDF2", false, ["deriveBits"]);
+  return hex(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 100000 }, k, 256));
 }
-.adslot {
-  border: 0 !important;
-  background: transparent !important;
-  min-height: 0 !important;
-  padding: 0 !important;
+const ch = async st => (await st.run()).meta.changes;
+const credit = (db, u, amt, k) => [
+  db.prepare("UPDATE users SET bal=ROUND(bal+?,2) WHERE id=?").bind(amt, u),
+  db.prepare("INSERT INTO hist(u,k,amt,ts) VALUES(?,?,?,?)").bind(u, k, amt, Date.now())];
+
+let READY = false;
+async function init(db) {
+  if (READY) return;
+  await db.batch([
+    "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,email TEXT UNIQUE,name TEXT,pw TEXT,salt TEXT,bal REAL DEFAULT 0,code TEXT UNIQUE,refby INTEGER DEFAULT 0,refok INTEGER DEFAULT 0,banned INTEGER DEFAULT 0,created INTEGER,lci INTEGER DEFAULT 0,streak INTEGER DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS sess(t TEXT PRIMARY KEY,u INTEGER,exp INTEGER)",
+    "CREATE TABLE IF NOT EXISTS farm(u INTEGER PRIMARY KEY,s INTEGER DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,url TEXT,rw REAL,on1 INTEGER DEFAULT 1)",
+    "CREATE TABLE IF NOT EXISTS tdone(u INTEGER,t INTEGER,s INTEGER,d INTEGER DEFAULT 0,PRIMARY KEY(u,t))",
+    "CREATE TABLE IF NOT EXISTS hist(id INTEGER PRIMARY KEY AUTOINCREMENT,u INTEGER,k TEXT,amt REAL,ts INTEGER)",
+    "CREATE INDEX IF NOT EXISTS hu ON hist(u,id)",
+    "CREATE TABLE IF NOT EXISTS wd(id INTEGER PRIMARY KEY AUTOINCREMENT,u INTEGER,m TEXT,a TEXT,amt REAL,st TEXT DEFAULT 'p',ts INTEGER)",
+    "CREATE TABLE IF NOT EXISTS cfg(k TEXT PRIMARY KEY,v TEXT)"].map(s => db.prepare(s)));
+  READY = true;
 }
-a[href*="arwf.org"] {
-  display: none !important;
+async function getCfg(db) {
+  const o = { ...DEF };
+  (await db.prepare("SELECT k,v FROM cfg").all()).results.forEach(r => { if (r.k in DEF) o[r.k] = NUM.includes(r.k) ? Number(r.v) : r.v });
+  return o;
 }
-</style>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#f4f8fc">
-<meta name="description" content="USA SPC — explore finance and crypto guides, play free mini-games, and learn through interactive challenges.">
-<title>USA Finance — Finance, Crypto & Play</title>
-<style>
-:root{--ink:#14243a;--muted:#65758b;--blue:#1769e0;--blue2:#0d4eae;--green:#12a875;--line:#e5edf5;--bg:#f4f8fc;--card:#fff;--shadow:0 12px 34px rgba(26,58,98,.08)}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer;border:0}button:focus-visible,a:focus-visible{outline:3px solid #8ab9ff;outline-offset:3px}.wrap{width:min(1120px,calc(100% - 32px));margin:auto}
-.topbar{background:#102b4d;color:#dceaff;font-size:12px;padding:7px 0}.topbar .wrap{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-header{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}.nav{height:72px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{display:flex;align-items:center;gap:10px;font-weight:900;font-size:21px;letter-spacing:-.7px}.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,var(--blue),#38b7d8);color:#fff;display:grid;place-items:center;font-weight:900;box-shadow:0 7px 18px #1769e044}.brand span:last-child{color:var(--blue)}nav{display:flex;gap:22px;color:#53657c;font-size:13px;font-weight:700}nav a:hover{color:var(--blue)}.navbtn,.btn{background:var(--blue);color:#fff;padding:11px 17px;border-radius:11px;font-weight:800;box-shadow:0 7px 16px #1769e02b}.navbtn:hover,.btn:hover{background:var(--blue2);transform:translateY(-1px)}
-.hero{padding:58px 0 30px;background:radial-gradient(circle at 85% 12%,#d9f4eb 0,transparent 27%),linear-gradient(135deg,#f6faff,#edf5ff)}.heroGrid{display:grid;grid-template-columns:1.2fr .8fr;gap:35px;align-items:center}.eyebrow{display:inline-flex;gap:8px;align-items:center;background:#e6f6ef;color:#087c53;border:1px solid #c9eddd;padding:6px 11px;border-radius:99px;font-size:11px;font-weight:900;letter-spacing:.5px;text-transform:uppercase}.hero h1{font-size:clamp(35px,5vw,58px);line-height:1.08;letter-spacing:-2px;margin:17px 0}.hero h1 em{font-style:normal;color:var(--blue)}.hero p{color:var(--muted);max-width:590px;font-size:16px}.heroActions{display:flex;gap:11px;flex-wrap:wrap;margin-top:23px}.btn.secondary{background:#fff;color:var(--blue);border:1px solid #d5e4f5;box-shadow:none}.heroArt{background:linear-gradient(145deg,#123d70,#1769e0);border-radius:26px;padding:25px;color:#fff;min-height:255px;box-shadow:0 20px 45px #1769e033;position:relative;overflow:hidden}.heroArt:after{content:"";position:absolute;width:230px;height:230px;border:1px solid #ffffff25;border-radius:50%;right:-70px;top:-80px;box-shadow:0 0 0 28px #ffffff0c,0 0 0 58px #ffffff08}.artTop{display:flex;justify-content:space-between;color:#c9e1ff;font-size:12px}.coinBig{font-size:42px;font-weight:900;margin:24px 0 0}.spark{color:#9df0ce;font-size:13px}.miniStats{display:flex;gap:10px;margin-top:22px}.miniStats div{background:#ffffff17;border:1px solid #ffffff22;padding:10px 13px;border-radius:12px;min-width:105px}.miniStats b{display:block;font-size:18px}.miniStats small{color:#c6dcf7}
-.adslot{margin:20px auto;padding:12px;border:1px dashed #c6d6e8;border-radius:14px;background:#fff;text-align:center;min-height:70px;overflow:hidden}.adlabel{font-size:9px;letter-spacing:1.4px;color:#9aa9ba;text-transform:uppercase;margin-bottom:7px}.adslot ins,.adslot iframe{max-width:100%}
-.section{padding:36px 0}.sectionHead{display:flex;justify-content:space-between;align-items:end;gap:15px;margin-bottom:19px}.sectionHead h2{margin:0;font-size:27px;letter-spacing:-.8px}.sectionHead p{margin:4px 0 0;color:var(--muted);font-size:13px}.tag{font-size:11px;color:#087c53;background:#e6f6ef;border-radius:99px;padding:5px 9px;font-weight:800}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.stat,.card{background:var(--card);border:1px solid var(--line);border-radius:17px;box-shadow:var(--shadow)}.stat{padding:17px}.stat small{color:var(--muted)}.stat strong{display:block;font-size:25px;margin-top:3px}.stat span{color:var(--green);font-size:11px;font-weight:800}
-.games{display:grid;grid-template-columns:repeat(2,1fr);gap:17px}.game{padding:20px}.game h3{margin:0 0 4px;font-size:19px}.game p{margin:0 0 15px;color:var(--muted);font-size:13px}.gameHead{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.gameIcon{width:42px;height:42px;border-radius:13px;background:#eaf2ff;display:grid;place-items:center;font-size:21px}.pill{background:#eef8f4;color:#07865b;border-radius:99px;padding:5px 9px;font-size:10px;font-weight:900}
-.wheelWrap{display:grid;place-items:center;padding:5px 0 12px}.wheel{width:218px;height:218px;border-radius:50%;border:8px solid #fff;box-shadow:0 4px 20px #153b6a24;position:relative;background:conic-gradient(#1769e0 0 45deg,#12a875 45deg 90deg,#f6b94b 90deg 135deg,#7657d5 135deg 180deg,#1769e0 180deg 225deg,#12a875 225deg 270deg,#f6b94b 270deg 315deg,#7657d5 315deg 360deg);transition:transform 4s cubic-bezier(.12,.72,.12,1)}.wheel:after{content:"";position:absolute;inset:43%;background:#fff;border:5px solid #dbe8f7;border-radius:50%}.pointer{position:absolute;z-index:2;top:-8px;left:calc(50% - 12px);width:0;height:0;border-left:12px solid transparent;border-right:12px solid transparent;border-top:25px solid #142d4b;filter:drop-shadow(0 2px 2px #0002)}
-.actionRow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.actionRow .btn{padding:9px 15px}.result{font-size:12px;color:var(--green);font-weight:800;min-height:20px}.puzzle{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;max-width:280px;margin:12px auto}.tile{aspect-ratio:1;background:#eaf2ff;color:#174b8f;border-radius:9px;font-size:20px;font-weight:900;box-shadow:inset 0 -3px #d5e5f7}.tile.empty{background:#f3f6fa;box-shadow:none}.tile:not(.empty):hover{background:#d9eaff}.gameTools{display:flex;justify-content:center;gap:15px;font-size:12px;color:var(--muted);margin:8px 0 12px}
-.quizQ{font-weight:800;margin:12px 0}.answers{display:grid;grid-template-columns:1fr 1fr;gap:8px}.answer{background:#f2f6fb;border:1px solid #e2eaf3;color:#314760;padding:10px;border-radius:10px;text-align:left;font-size:12px;font-weight:700}.answer:hover{border-color:#78a9e8}.answer.correct{background:#e4f7ed;border-color:#70c89d}.answer.wrong{background:#fff0ef;border-color:#efaaa5}
-.prediction{display:flex;gap:10px}.predBtn{flex:1;padding:13px;border-radius:12px;background:#edf4ff;color:#1769e0;font-weight:900}.predBtn.down{background:#e8f8f1;color:#07865b}.predBtn:disabled{opacity:.5;cursor:not-allowed}.predictionNote{font-size:11px;color:var(--muted);margin-top:10px}
-.articleGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.article{padding:18px;display:flex;flex-direction:column;min-height:205px}.article .category{color:var(--blue);font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:1px}.article h3{font-size:16px;line-height:1.35;margin:9px 0}.article p{font-size:12px;color:var(--muted);margin:0 0 13px}.read{margin-top:auto;color:var(--blue);font-size:12px;font-weight:900;background:none;padding:0;text-align:left}.articleBody{display:none;margin-top:12px;border-top:1px solid var(--line);padding-top:12px;color:#53657c;font-size:12px}.article.open .articleBody{display:block}
-.factGrid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.fact{padding:22px;background:linear-gradient(135deg,#fff,#eff8ff)}.fact h3{margin:0 0 8px}.fact p{color:var(--muted);margin:0}.leader{padding:20px}.leaderRow{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}.leaderRow:last-child{border:0}.badgeGrid{display:flex;flex-wrap:wrap;gap:9px}.achievement{background:#f2f6fb;border:1px solid var(--line);padding:9px 11px;border-radius:12px;font-size:11px;color:#75849a}.achievement.unlocked{background:#e8f8f1;color:#087c53;border-color:#c9eddd;font-weight:800}
-.progressTrack{height:5px;background:#e5edf5;position:fixed;top:0;left:0;z-index:50;width:100%}.progressFill{height:100%;background:linear-gradient(90deg,#1769e0,#12a875);width:0}
-footer{background:#102b4d;color:#d7e5f7;padding:30px 0;margin-top:35px}footer p{color:#a9bed8;font-size:12px}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.fine{font-size:10px;color:#a9bed8;max-width:760px}
-.modal{position:fixed;inset:0;background:#07182dcc;z-index:40;display:none;place-items:center;padding:18px}.modal.show{display:grid}.modalBox{background:#fff;border-radius:18px;padding:23px;max-width:540px;width:100%;max-height:80vh;overflow:auto}.modalBox h2{margin-top:0}.close{float:right;background:#edf3fa;border-radius:8px;padding:5px 10px}
-@media(max-width:760px){nav{display:none}.hero{padding-top:37px}.heroGrid{grid-template-columns:1fr}.heroArt{min-height:220px}.games{grid-template-columns:1fr}.articleGrid{grid-template-columns:1fr 1fr}.factGrid{grid-template-columns:1fr}.sectionHead h2{font-size:23px}}
-@media(max-width:470px){.articleGrid{grid-template-columns:1fr}.stats{gap:8px}.stat{padding:12px}.stat strong{font-size:20px}.hero h1{letter-spacing:-1.3px}.wheel{width:200px;height:200px}.topbar .wrap{justify-content:center}}
-</style>
-</head>
-<body>
-<div class="progressTrack"><div class="progressFill" id="readingProgress"></div></div>
-<div class="topbar"><div class="wrap"><span>USA SPC · Learn finance. Explore crypto. Play smart.</span><span>Educational content · Virtual game points only</span></div></div>
-<header><div class="wrap nav"><a class="brand" href="#"><span class="logo">S</span><span>USA <span>SPC</span></span></a><nav><a href="#games">Games</a><a href="#articles">Articles</a><a href="#facts">Crypto Facts</a><a href="#leaderboard">Leaderboard</a></nav><a class="navbtn" href="#games">Play Now ↗</a></div></header>
-<main>
-<section class="hero"><div class="wrap heroGrid"><div><span class="eyebrow">✦ Finance meets fun</span><h1>Discover crypto.<br><em>Play, learn & grow.</em></h1><p>Explore simple finance guides, test your crypto knowledge, solve puzzles and enjoy free mini-games — all in one friendly place.</p><div class="heroActions"><a class="btn" href="#games">Explore Games</a><a class="btn secondary" href="#articles">Read Articles</a></div></div><div class="heroArt"><div class="artTop"><span>USA SPC COMMUNITY</span><span>✦ LEARN & PLAY</span></div><div class="coinBig">SPC <span class="spark">✦</span></div><div>Small steps. Smarter decisions.</div><div class="miniStats"><div><b id="heroPoints">0</b><small>Your points</small></div><div><b id="heroBadges">0/6</b><small>Badges earned</small></div></div></div></div></section>
+async function mkSess(db, u) {
+  const t = rnd(24);
+  await db.prepare("INSERT INTO sess(t,u,exp) VALUES(?,?,?)").bind(t, u, Date.now() + 30 * 864e5).run();
+  await db.prepare("DELETE FROM sess WHERE exp<?").bind(Date.now()).run();
+  return t;
+}
 
-<div class="wrap"><div class="adslot"><div class="adlabel">Advertisement</div><script data-cfasync="false" src="https://bicea.org/14/e5a1c34bddfa3fd74187b84e714af255"></script></div></div>
-<section class="section"><div class="wrap"><div class="sectionHead"><div><h2>Your activity</h2><p>Points and progress saved on this device.</p></div><span class="tag">FREE PLAY</span></div><div class="stats"><div class="stat"><small>Virtual points</small><strong id="points">0</strong><span>✦ Earned by playing</span></div><div class="stat"><small>Games played</small><strong id="plays">0</strong><span>↗ Keep exploring</span></div><div class="stat"><small>Articles opened</small><strong id="reads">0</strong><span>▤ Learn something new</span></div></div></div></section>
+// ---------------------------------------------------------------- API
+async function api(req, env) {
+  const db = env.DB; await init(db);
+  let b; try { b = await req.json() } catch (e) { return J({ e: "Bad request" }, 400) }
+  const a = String(b.a || ""), now = Date.now(), c = await getCfg(db);
 
-<div class="wrap"><div class="adslot"><div class="adlabel">Sponsored link</div><a href="https://arwf.org/4/0cdb97f6159290a9b794727fdb6ee6cc" target="_blank" rel="nofollow sponsored noopener" class="btn secondary">Visit sponsored offer ↗</a></div></div>
+  if (a === "reg") {
+    const em = String(b.email || "").trim().toLowerCase(), nm = String(b.name || "").trim().slice(0, 30), pw = String(b.pass || "");
+    if (!EM.test(em) || em.length > 100) return J({ e: "Invalid email" }, 400);
+    if (!nm) return J({ e: "Enter your name" }, 400);
+    if (pw.length < 6 || pw.length > 100) return J({ e: "Password must be 6+ characters" }, 400);
+    const salt = rnd(8), code = rnd(4);
+    const rf = b.ref ? await db.prepare("SELECT id FROM users WHERE code=?").bind(String(b.ref).slice(0, 12)).first() : null;
+    try { await db.prepare("INSERT INTO users(email,name,pw,salt,code,refby,created) VALUES(?,?,?,?,?,?,?)").bind(em, nm, await hash(pw, salt), salt, code, rf ? rf.id : 0, now).run() }
+    catch (e) { return J({ e: "Email already registered" }, 400) }
+    const u = await db.prepare("SELECT id FROM users WHERE email=?").bind(em).first();
+    return J({ t: await mkSess(db, u.id) });
+  }
+  if (a === "login") {
+    const em = String(b.email || "").trim().toLowerCase();
+    const u = await db.prepare("SELECT id,pw,salt,banned FROM users WHERE email=?").bind(em).first();
+    if (!u || u.pw !== await hash(String(b.pass || ""), u.salt)) return J({ e: "Wrong email or password" }, 400);
+    if (u.banned) return J({ e: "Account blocked" }, 403);
+    return J({ t: await mkSess(db, u.id) });
+  }
 
-<section class="section" id="games"><div class="wrap"><div class="sectionHead"><div><h2>Play & earn virtual points</h2><p>Play for fun. Rewards have no cash or token value.</p></div><span class="tag">INTERACTIVE ZONE</span></div>
-<div class="games">
-<div class="card game"><div class="gameHead"><div class="gameIcon">🎡</div><span class="pill">UNLIMITED SPINS</span></div><h3>Lucky Spin</h3><p>Spin the wheel any time and win a random virtual score.</p><div class="wheelWrap"><div class="pointer"></div><div class="wheel" id="wheel"></div></div><div class="actionRow"><button class="btn" id="spinBtn">Spin the wheel</button><span class="result" id="spinResult" aria-live="polite"></span></div></div>
-<div class="card game"><div class="gameHead"><div class="gameIcon">🧩</div><span class="pill">NUMBER CHALLENGE</span></div><h3>Number Puzzle</h3><p>Arrange the tiles from 1 to 15. Tap a tile beside the empty space.</p><div class="gameTools"><span>Moves: <b id="moves">0</b></span><span>Time: <b id="timer">0s</b></span></div><div class="puzzle" id="puzzle"></div><div class="actionRow"><button class="btn" id="shuffleBtn">New Puzzle</button><span class="result" id="puzzleResult"></span></div></div>
-<div class="card game"><div class="gameHead"><div class="gameIcon">🧠</div><span class="pill">KNOWLEDGE CHECK</span></div><h3>Crypto Quiz</h3><p>Answer a quick question and test what you know.</p><div id="quizArea"><div class="quizQ" id="quizQuestion"></div><div class="answers" id="quizAnswers"></div></div><div class="result" id="quizResult" style="margin-top:12px"></div><div class="actionRow"><button class="btn" id="nextQuiz">Next Question</button></div></div>
-<div class="card game"><div class="gameHead"><div class="gameIcon">📈</div><span class="pill">PRACTICE ONLY</span></div><h3>Price Prediction</h3><p>Practice reading a fictional market scenario. This is not a live price feed or financial advice.</p><div class="stat" style="box-shadow:none;background:#f7faff"><small>Simulation market</small><strong id="fakePrice">$64,250</strong><span id="marketMove">Practice scenario</span></div><div class="prediction" style="margin-top:13px"><button class="predBtn" id="predictUp">↗ Goes up</button><button class="predBtn down" id="predictDown">↘ Goes down</button></div><div class="predictionNote" id="predictionResult">Choose a direction to play one round.</div></div>
-</div></div></section>
+  const s = await db.prepare("SELECT u FROM sess WHERE t=? AND exp>?").bind((req.headers.get("authorization") || "").slice(7), now).first();
+  if (!s) return J({ e: "auth" }, 401);
+  const u = await db.prepare("SELECT * FROM users WHERE id=?").bind(s.u).first();
+  if (!u || u.banned) return J({ e: "Account blocked" }, 403);
+  const adm = !!env.ADMIN_EMAIL && u.email === env.ADMIN_EMAIL.trim().toLowerCase();
+  if (a.startsWith("ad") && !adm) return J({ e: "No access" }, 403);
 
-<div class="wrap"><div class="adslot"><div class="adlabel">Advertisement</div><script async="async" data-cfasync="false" src="https://bicea.org/21/cf8d7ed0b1da47387932f9da273786a3"></script><div id="container-cf8d7ed0b1da47387932f9da273786a3"></div></div></div>
+  if (a === "me") {
+    const f = await db.prepare("SELECT s FROM farm WHERE u=?").bind(u.id).first();
+    const tk = (await db.prepare("SELECT t.id,t.title,t.url,t.rw,d.s,d.d FROM tasks t LEFT JOIN tdone d ON d.t=t.id AND d.u=? WHERE t.on1=1 ORDER BY t.id DESC").bind(u.id).all()).results;
+    const h = (await db.prepare("SELECT k,amt,ts FROM hist WHERE u=? ORDER BY id DESC LIMIT 30").bind(u.id).all()).results;
+    const w = (await db.prepare("SELECT id,m,a,amt,st,ts FROM wd WHERE u=? ORDER BY id DESC LIMIT 15").bind(u.id).all()).results;
+    const rc = await db.prepare("SELECT COUNT(*) n,COALESCE(SUM(refok),0) k FROM users WHERE refby=?").bind(u.id).first();
+    return J({ u: { name: u.name, email: u.email, bal: u.bal, code: u.code, streak: u.streak, ci: u.lci === day(now) }, fs: f ? f.s : 0, now, c, tk, h, w, rc, adm });
+  }
+  if (a === "fs") {
+    await db.prepare("INSERT OR IGNORE INTO farm(u,s) VALUES(?,0)").bind(u.id).run();
+    if (!await ch(db.prepare("UPDATE farm SET s=? WHERE u=? AND s=0").bind(now, u.id))) return J({ e: "Already farming" }, 400);
+    return J({ msg: "Farming started 🌱" });
+  }
+  if (a === "fh") {
+    if (!await ch(db.prepare("UPDATE farm SET s=0 WHERE u=? AND s>0 AND s<=?").bind(u.id, now - c.farm_h * 36e5))) return J({ e: "Not ready yet" }, 400);
+    await db.batch(credit(db, u.id, c.farm_r, "farm"));
+    // referral bonus: paid once, when the invited user finishes the first harvest
+    if (u.refby && !u.refok && await ch(db.prepare("UPDATE users SET refok=1 WHERE id=? AND refok=0").bind(u.id)))
+      await db.batch(credit(db, u.refby, c.ref, "ref"));
+    return J({ msg: "Harvested +" + c.cur + c.farm_r });
+  }
+  if (a === "ci") {
+    const d = day(now), st = u.lci === d - 1 ? u.streak + 1 : 1, arr = c.ci.split(",").map(Number), rw = r2(arr[(st - 1) % arr.length] || 0);
+    if (!await ch(db.prepare("UPDATE users SET lci=?,streak=? WHERE id=? AND lci<?").bind(d, st, u.id, d))) return J({ e: "Already checked in today" }, 400);
+    await db.batch(credit(db, u.id, rw, "ci"));
+    return J({ msg: "Check-in +" + c.cur + rw });
+  }
+  if (a === "ts") {
+    const id = Number(b.id);
+    if (!await db.prepare("SELECT id FROM tasks WHERE id=? AND on1=1").bind(id).first()) return J({ e: "Task not found" }, 400);
+    await db.prepare("INSERT OR IGNORE INTO tdone(u,t,s) VALUES(?,?,?)").bind(u.id, id, now).run();
+    return J({});
+  }
+  if (a === "tc") {
+    const id = Number(b.id), t = await db.prepare("SELECT rw FROM tasks WHERE id=? AND on1=1").bind(id).first();
+    if (!t) return J({ e: "Task not found" }, 400);
+    if (!await ch(db.prepare("UPDATE tdone SET d=1 WHERE u=? AND t=? AND d=0 AND s<=?").bind(u.id, id, now - c.secs * 1000))) return J({ e: "Please wait for the timer" }, 400);
+    await db.batch(credit(db, u.id, t.rw, "task"));
+    return J({ msg: "Task done +" + c.cur + t.rw });
+  }
+  if (a === "wr") {
+    const m = String(b.m), ac = String(b.ac || "").trim(), amt = r2(Number(b.amt));
+    if (!c.wd) return J({ e: "Withdraw is closed right now" }, 400);
+    if (!["bkash", "nagad", "paypal"].includes(m)) return J({ e: "Choose a method" }, 400);
+    if (m === "paypal" ? !EM.test(ac) : !/^01[3-9][0-9]{8}$/.test(ac)) return J({ e: m === "paypal" ? "Enter your PayPal email" : "Enter a valid 11-digit number" }, 400);
+    if (!(amt >= c.minw)) return J({ e: "Minimum withdraw is " + c.cur + c.minw }, 400);
+    if ((await db.prepare("SELECT COUNT(*) n FROM wd WHERE u=? AND st='p'").bind(u.id).first()).n >= 1) return J({ e: "You already have a pending request" }, 400);
+    if (!await ch(db.prepare("UPDATE users SET bal=ROUND(bal-?,2) WHERE id=? AND bal>=?").bind(amt, u.id, amt))) return J({ e: "Not enough balance" }, 400);
+    await db.batch([db.prepare("INSERT INTO wd(u,m,a,amt,ts) VALUES(?,?,?,?,?)").bind(u.id, m, ac, amt, now),
+      db.prepare("INSERT INTO hist(u,k,amt,ts) VALUES(?,?,?,?)").bind(u.id, "wd", -amt, now)]);
+    return J({ msg: "Withdraw request sent ✓" });
+  }
 
-<section class="section" id="articles"><div class="wrap"><div class="sectionHead"><div><h2>Finance & crypto guides</h2><p>Six beginner-friendly reads to build your knowledge.</p></div><span class="tag">6 ARTICLES</span></div><div class="articleGrid" id="articleGrid"></div></div></section>
-
-<div class="wrap"><div class="adslot"><div class="adlabel">Advertisement</div><script data-cfasync="false" src="https://afders.org/1/e4b91bb2ff55c63a204a832e344d5c7e"></script></div></div>
-
-<section class="section" id="facts"><div class="wrap"><div class="sectionHead"><div><h2>Crypto facts & daily challenge</h2><p>Little discoveries make learning easier.</p></div><span class="tag">DISCOVER</span></div><div class="factGrid"><div class="card fact"><span class="eyebrow">TODAY'S CRYPTO FACT</span><h3 id="factTitle" style="margin-top:13px">A public blockchain is viewable by anyone.</h3><p id="factText">Many public blockchains let people independently inspect transactions and verify activity without needing permission from a central operator.</p><div class="actionRow" style="margin-top:17px"><button class="btn" id="newFact">Another fact</button><button class="btn secondary" id="dailyChallenge">Daily challenge</button></div><div class="result" id="dailyResult" style="margin-top:10px"></div></div><div class="card leader" id="leaderboard"><h3 style="margin:0 0 5px">🏆 Local leaderboard</h3><p style="font-size:12px;color:var(--muted);margin-top:0">Best scores saved in this browser only.</p><div id="leaderRows"></div></div></div></div></section>
-
-<section class="section"><div class="wrap"><div class="sectionHead"><div><h2>Your achievements</h2><p>Unlock badges as you explore USA SPC.</p></div><span class="tag">MILESTONES</span></div><div class="card" style="padding:20px"><div class="badgeGrid" id="badges"></div></div></div></section>
-
-<div class="wrap"><div class="adslot"><div class="adlabel">Advertisement</div><script>atOptions = {'key':'385a5ea7766d8aa13251915a1064ad4d','format':'iframe','height':300,'width':160,'params':{}};</script><script src="https://bicea.org/22/385a5ea7766d8aa13251915a1064ad4d"></script></div></div>
-</main>
-<footer><div class="wrap foot"><div><a class="brand" href="#" style="color:#fff"><span class="logo">S</span><span style="color:#fff">USA <span>SPC</span></span></a><p>Learn finance. Explore crypto. Play smart.</p></div><div><a href="#articles">Articles</a> · <a href="#games">Games</a> · <a href="#facts">Facts</a></div></div><div class="wrap fine"><p><b>Important notice:</b> USA SPC is an educational and entertainment simulation website. All points, spins, game scores and price scenarios are fictional virtual values. They are not cryptocurrency, cash, investments, deposits or withdrawable rewards. Nothing on this website is financial advice. Cryptocurrency is volatile and involves risk. Sponsored advertisements are provided by third parties; always review external websites independently.</p><p>© <span id="year"></span> USA SPC. All rights reserved. · <a href="#" id="privacyLink">Privacy notice</a> · <a href="#" id="termsLink">Terms</a></p></div></footer>
-<div class="modal" id="infoModal"><div class="modalBox"><button class="close" id="closeModal">Close ✕</button><div id="modalContent"></div></div></div>
-<script>
-(()=>{'use strict';
-const $=id=>document.getElementById(id);
-const get=(k,d)=>{try{return JSON.parse(localStorage.getItem('usasp_'+k))??d}catch{return d}};
-const set=(k,v)=>{try{localStorage.setItem('usasp_'+k,JSON.stringify(v))}catch{}};
-let state=get('state',{points:0,plays:0,reads:0,spin:0,quiz:0,puzzle:0,prediction:0,challenge:0});
-const save=()=>{set('state',state);renderStats();renderBadges();renderLeader()};
-function award(n,reason){state.points+=n;state.plays++;save();return '+'+n+' virtual points · '+reason}
-function renderStats(){$('points').textContent=state.points;$('plays').textContent=state.plays;$('reads').textContent=state.reads;$('heroPoints').textContent=state.points;$('heroBadges').textContent=unlocked().length+'/6'}
-const badgeDefs=[['🎡','Spin starter',()=>state.spin>=1],['🧩','Puzzle solver',()=>state.puzzle>=1],['🧠','Quiz learner',()=>state.quiz>=1],['📈','Market watcher',()=>state.prediction>=1],['📚','Curious reader',()=>state.reads>=3],['⭐','Point collector',()=>state.points>=100]];
-function unlocked(){return badgeDefs.filter(x=>x[2]())}
-function renderBadges(){$('badges').innerHTML=badgeDefs.map(b=>'<span class="achievement '+(b[2]?'unlocked':'')+'">'+b[0]+' '+b[1]+(b[2]()?' ✓':' · Locked')+'</span>').join('');$('heroBadges').textContent=unlocked().length+'/6'}
-function renderLeader(){let rows=get('leader',[]);rows=[...rows,{name:'You',score:state.points}].sort((a,b)=>b.score-a.score).slice(0,5);$('leaderRows').innerHTML=rows.map((r,i)=>'<div class="leaderRow"><span>'+(i+1)+'. '+escapeHtml(r.name)+'</span><b>'+r.score+' pts</b></div>').join('')}
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-const articles=[
-['PERSONAL FINANCE','Build a simple monthly budget','A budget is a plan for how you use your money. Start by listing income, fixed bills, everyday spending and savings goals. Review it weekly and adjust categories when real life changes. A useful budget is realistic, flexible and easy to understand.'],
-['CRYPTO BASICS','What is cryptocurrency?','Cryptocurrency is a digital asset that can be transferred using cryptographic networks. Different projects have different designs, risks and uses. Before using one, research its purpose, governance, security model, fees and the risks of losing access.'],
-['BITCOIN','Understanding Bitcoin and scarcity','Bitcoin is a peer-to-peer digital currency network with a programmed issuance schedule. Its supply rules are part of its protocol, but scarcity alone does not guarantee a particular price or investment return. Prices can move sharply in either direction.'],
-['BLOCKCHAIN','How does a blockchain work?','A blockchain is a shared ledger maintained by a network of computers. Transactions are grouped into blocks and linked using cryptography. Consensus rules help participants agree on the ledger state, while different networks make different trade-offs.'],
-['RISK MANAGEMENT','Why risk management matters','Never risk money you cannot afford to lose. Understand volatility, avoid concentrated exposure, protect account credentials and be cautious of guaranteed-return claims. A plan should include security, time horizon and a clear limit on potential losses.'],
-['INVESTING','Research before making a decision','Good research starts with primary documentation, transparent fees, independent security reviews and an understanding of how a product works. Separate facts from marketing, compare alternatives and remember that past performance does not predict future results.']
-];
-$('articleGrid').innerHTML=articles.map((a,i)=>'<article class="card article"><span class="category">'+a[0]+'</span><h3>'+a[1]+'</h3><p>'+a[2].slice(0,105)+'…</p><button class="read" data-read="'+i+'">Read article →</button><div class="articleBody">'+a[2]+'</div></article>').join('');
-$('articleGrid').addEventListener('click',e=>{let b=e.target.closest('[data-read]');if(!b)return;let card=b.closest('.article');card.classList.toggle('open');b.textContent=card.classList.contains('open')?'Close article ↑':'Read article →';if(card.classList.contains('open')){state.reads++;save()}});
-const rewards=[5,10,15,20,25,30,50,100];let spinning=false;
-$('spinBtn').onclick=()=>{if(spinning)return;spinning=true;$('spinBtn').disabled=true;let reward=rewards[Math.floor(Math.random()*rewards.length)],turn=360*5+Math.floor(Math.random()*360);$('wheel').style.transform='rotate('+((get('rotation',0)+turn))+'deg)';set('rotation',get('rotation',0)+turn);$('spinResult').textContent='Spinning…';setTimeout(()=>{$('spinResult').textContent=award(reward,'Lucky Spin');state.spin++;save();spinning=false;$('spinBtn').disabled=false},4100)};
-let tiles=[],moves=0,startTime=0;
-function puzzleDraw(){$('puzzle').innerHTML=tiles.map((n,i)=>'<button class="tile '+(!n?'empty':'')+'" data-i="'+i+'" '+(!n?'disabled':'')+'>'+(n||'')+'</button>').join('');$('moves').textContent=moves}
-function solved(){return tiles.every((n,i)=>n===((i+1)%16))}
-function shuffle(){tiles=Array.from({length:16},(_,i)=>(i+1)%16);for(let i=0;i<180;i++){let z=tiles.indexOf(0),opts=[z-4,z+4,...(z%4?[z-1]:[]),...(z%4<3?[z+1]:[])].filter(x=>x>=0&&x<16&&Math.abs((x%4)-(z%4))+Math.abs(Math.floor(x/4)-Math.floor(z/4))===1);let t=opts[Math.floor(Math.random()*opts.length)];[tiles[z],tiles[t]]=[tiles[t],tiles[z]]}moves=0;startTime=Date.now();$('timer').textContent='0s';$('puzzleResult').textContent='';puzzleDraw()}
-$('puzzle').onclick=e=>{let b=e.target.closest('[data-i]');if(!b)return;let i=+b.dataset.i,z=tiles.indexOf(0);if(Math.abs((i%4)-(z%4))+Math.abs(Math.floor(i/4)-Math.floor(z/4))!==1)return;[tiles[i],tiles[z]]=[tiles[z],tiles[i]];moves++;puzzleDraw();$('timer').textContent=Math.floor((Date.now()-startTime)/1000)+'s';if(solved()){$('puzzleResult').textContent=award(Math.max(10,60-moves),'Puzzle solved');state.puzzle++;save()}};$('shuffleBtn').onclick=shuffle;shuffle();
-const questions=[['Which network introduced the concept of a blockchain-based cryptocurrency known as Bitcoin?',['Bitcoin','Ethereum','Solana','Litecoin'],0],['What does a private key help you do?',['Decorate a wallet','Control access to assets','Predict prices','Reduce network fees'],1],['What is a stablecoin designed to do?',['Track a reference value','Always increase','Mine Bitcoin','Replace passwords'],0],['What is a blockchain explorer used for?',['View on-chain data','Create passwords','Guarantee profit','Hide all transactions'],0],['What does DYOR commonly mean?',['Do Your Own Research','Deposit Your Own Reward','Digital Yield On Return','Daily Yearly Output Rate'],0]];
-let qi=0,answered=false;
-function quizDraw(){let q=questions[qi];$('quizQuestion').textContent=(qi+1)+'. '+q[0];$('quizAnswers').innerHTML=q[1].map((v,i)=>'<button class="answer" data-a="'+i+'">'+v+'</button>').join('');$('quizResult').textContent='';answered=false}
-$('quizAnswers').onclick=e=>{let b=e.target.closest('[data-a]');if(!b||answered)return;answered=true;let q=questions[qi],ok=+b.dataset.a===q[2];[...$('quizAnswers').children].forEach((el,i)=>{if(i===q[2])el.classList.add('correct');else if(i===+b.dataset.a)el.classList.add('wrong')});$('quizResult').textContent=ok?award(15,'Correct answer'):'Not quite — read the explanation and try another question.';if(ok){state.quiz++;save()}};
-$('nextQuiz').onclick=()=>{qi=(qi+1)%questions.length;quizDraw()};quizDraw();
-let market=64250,round=false;
-function prediction(dir){if(round)return;round=true;$('predictUp').disabled=$('predictDown').disabled=true;let actual=Math.random()>.5?'up':'down';setTimeout(()=>{market+=actual==='up'?Math.round(Math.random()*950+80):-Math.round(Math.random()*950+80);$('fakePrice').textContent='$'+market.toLocaleString();$('marketMove').textContent=actual==='up'?'▲ Fictional scenario':'▼ Fictional scenario';let win=dir===actual;$('predictionResult').textContent=(win?award(20,'Prediction correct'):'No points this round')+' · Scenario moved '+actual+'.';if(win){state.prediction++;save()}$('predictUp').disabled=$('predictDown').disabled=false;round=false},700)}
-$('predictUp').onclick=()=>prediction('up');$('predictDown').onclick=()=>prediction('down');
-const facts=[['Bitcoin has a fixed maximum supply','Bitcoin’s protocol specifies a maximum supply of 21 million BTC, although this does not make its market price predictable.'],['Not all blockchains work the same way','Networks use different consensus mechanisms, fee models, governance structures and security assumptions.'],['A seed phrase is highly sensitive','Anyone who obtains a wallet recovery phrase may be able to control the assets associated with that wallet. Never share it.'],['Transactions may be irreversible','Many crypto transfers cannot simply be cancelled after confirmation. Always verify the recipient address and network.'],['Stablecoins still have risks','A stablecoin can face reserve, issuer, liquidity, regulatory and de-pegging risks. “Stable” does not mean risk-free.']];
-$('newFact').onclick=()=>{let f=facts[Math.floor(Math.random()*facts.length)];$('factTitle').textContent=f[0];$('factText').textContent=f[1]};
-$('dailyChallenge').onclick=()=>{let day=new Date().toISOString().slice(0,10);if(get('challengeDay','')===day){$('dailyResult').textContent='You have already claimed today’s challenge.';return}set('challengeDay',day);state.challenge++;state.points+=10;save();$('dailyResult').textContent='+10 virtual points · Daily challenge completed!'};
-$('year').textContent=new Date().getFullYear();
-window.addEventListener('scroll',()=>{let max=document.documentElement.scrollHeight-innerHeight; $('readingProgress').style.width=(max>0?scrollY/max*100:0)+'%'});
-$('privacyLink').onclick=$('termsLink').onclick=e=>{e.preventDefault();$('modalContent').innerHTML='<h2>Privacy & Terms</h2><p>This single-file version stores game scores and progress in local browser storage on your device. It does not create accounts or send game scores to a server. Clearing browser data may erase progress.</p><p>Third-party advertising providers may use cookies or similar technologies under their own policies. Review the relevant provider notices and configure consent requirements applicable to your audience and location.</p><p>USA SPC is an educational entertainment simulation. No points have cash value and no prize, investment return or payout is promised. Content is general information, not financial advice.</p>';$('infoModal').classList.add('show')};
-$('closeModal').onclick=()=>$('infoModal').classList.remove('show');$('infoModal').onclick=e=>{if(e.target.id==='infoModal')e.currentTarget.classList.remove('show')};
-renderStats();renderBadges();renderLeader();
-})();
-</script>
-</body></html>`;
+  // ------------------------------------------------------------ admin
+  if (a === "ad") {
+    const q = "%" + String(b.q || "").trim().toLowerCase() + "%";
+    const st = await db.prepare("SELECT COUNT(*) n,COALESCE(SUM(bal),0) b FROM users").first();
+    const w = (await db.prepare("SELECT w.id,w.m,w.a,w.amt,u.email FROM wd w JOIN users u ON u.id=w.u WHERE w.st='p' ORDER BY w.id LIMIT 50").all()).results;
+    const t = (await db.prepare("SELECT id,title,url,rw FROM tasks WHERE on1=1 ORDER BY id DESC").all()).results;
+    const us = b.q ? (await db.prepare("SELECT id,email,name,bal,banned FROM users WHERE email LIKE ? OR name LIKE ? LIMIT 10").bind(q, q).all()).results : [];
+    return J({ st, w, t, us });
+  }
+  if (a === "adw") {
+    const id = Number(b.id), w = await db.prepare("SELECT u,amt FROM wd WHERE id=? AND st='p'").bind(id).first();
+    if (!w) return J({ e: "Already handled" }, 400);
+    if (b.ok) { await db.prepare("UPDATE wd SET st='d' WHERE id=? AND st='p'").bind(id).run(); return J({ msg: "Marked as paid" }) }
+    if (await ch(db.prepare("UPDATE wd SET st='r' WHERE id=? AND st='p'").bind(id))) await db.batch(credit(db, w.u, w.amt, "refund"));
+    return J({ msg: "Rejected and refunded" });
+  }
+  if (a === "adj") {
+    const amt = r2(Number(b.amt)); if (!amt) return J({ e: "Enter an amount" }, 400);
+    await db.batch(credit(db, Number(b.id), amt, "admin")); return J({ msg: "Balance adjusted" });
+  }
+  if (a === "adb") { await db.prepare("UPDATE users SET banned=? WHERE id=? AND email<>?").bind(b.on ? 1 : 0, Number(b.id), u.email).run(); return J({ msg: "Done" }) }
+  if (a === "adt") {
+    const rw = r2(Number(b.rw)), t = String(b.title || "").trim().slice(0, 80), url = String(b.url || "").trim();
+    if (!t || !/^https?:\/\//.test(url) || !(rw > 0)) return J({ e: "Title, a full link (https://) and reward are needed" }, 400);
+    await db.prepare("INSERT INTO tasks(title,url,rw) VALUES(?,?,?)").bind(t, url, rw).run(); return J({ msg: "Task added" });
+  }
+  if (a === "adx") { await db.prepare("UPDATE tasks SET on1=0 WHERE id=?").bind(Number(b.id)).run(); return J({ msg: "Task removed" }) }
+  if (a === "adcfg") {
+    for (const k of Object.keys(DEF)) {
+      if (b[k] === undefined) continue;
+      let v = String(b[k]).slice(0, 200);
+      if (NUM.includes(k)) { v = Number(v); if (!isFinite(v) || v < 0) return J({ e: "Invalid " + k }, 400) }
+      await db.prepare("INSERT INTO cfg(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(k, String(v)).run();
+    }
+    return J({ msg: "Settings saved" });
+  }
+  return J({ e: "Unknown action" }, 400);
+}
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (url.pathname === "/health") {
-      return new Response("USA SPC Worker is running.", {
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
-    }
-    if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
-    return new Response(HTML, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "public, max-age=300",
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "strict-origin-when-cross-origin",
-        "permissions-policy": "camera=(), microphone=(), geolocation=()"
-      }
-    });
+  async fetch(req, env) {
+    try {
+      if (new URL(req.url).pathname === "/api" && req.method === "POST") return await api(req, env);
+      return new Response(HTML, { headers: { "content-type": "text/html;charset=utf-8", "cache-control": "no-store" } });
+    } catch (e) { return J({ e: "Server error" }, 500) }
   }
 };
+
+// ---------------------------------------------------------------- Frontend
+const HTML = String.raw`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Earn</title>
+<style>
+:root{--bg:#0d1512;--cd:#16211c;--ln:#24352d;--tx:#e8f3ec;--mu:#8fa89a;--g:#2ecc71;--y:#f1c40f;--r:#e74c3c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px system-ui,sans-serif;padding-bottom:76px}
+.w{max-width:520px;margin:0 auto;padding:14px}.c{background:var(--cd);border:1px solid var(--ln);border-radius:14px;padding:14px;margin-bottom:12px}
+.r{display:flex;justify-content:space-between;align-items:center;gap:10px}.m{color:var(--mu);font-size:13px}h1{margin:6px 0 14px;font-size:22px}
+.big{font-size:34px;font-weight:700;margin:4px 0}input,select{width:100%;padding:11px;margin:5px 0;border-radius:10px;border:1px solid var(--ln);background:#0f1a15;color:var(--tx);font:inherit}
+.b{background:var(--g);color:#06210f;border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:600;width:100%;margin-top:6px}.b.s{width:auto;padding:8px 14px;margin:0}
+.b.gd{background:var(--y)}.b.x{background:var(--r);color:#fff}.b.l{background:none;color:var(--mu);font-weight:400}
+.bar{height:10px;background:#0f1a15;border-radius:6px;overflow:hidden;margin:10px 0}.bar i{display:block;height:100%;background:var(--g)}
+nav{position:fixed;bottom:0;left:0;right:0;background:var(--cd);border-top:1px solid var(--ln);display:flex;padding-bottom:env(safe-area-inset-bottom)}
+nav a{flex:1;text-align:center;padding:12px 0;color:var(--mu);font-size:12px}nav a.on{color:var(--g)}
+#to{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#fff;color:#000;padding:10px 16px;border-radius:10px;display:none;z-index:9;max-width:90%}
+.pl{color:var(--g)}.mi{color:var(--r)}
+</style></head><body><div class="w" id="app"></div><nav id="nav"></nav><div id="to"></div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let TK=localStorage.getItem("t"),S=null,tab="h",off=0,AD=null,AQ="",mode="login",tt;
+const money=n=>S.c.cur+(+n).toFixed(2);
+const fmt=ms=>{const s=Math.max(0,Math.floor(ms/1e3));return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m "+s%60+"s"};
+function toast(m){const t=$("to");t.textContent=m;t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",2500)}
+async function api(a,d){const r=await fetch("/api",{method:"POST",headers:{authorization:"Bearer "+(TK||"")},body:JSON.stringify(Object.assign({a:a},d||{}))});const j=await r.json();
+ if(r.status===401&&a!=="login"&&a!=="reg"){TK=null;localStorage.removeItem("t");S=null;render();throw 0}return j}
+async function load(){S=await api("me");off=S.now-Date.now();if(S.adm&&tab=="a")await adload();render()}
+async function adload(q){if(q!==undefined)AQ=q;AD=await api("ad",{q:AQ})}
+async function act(a,d){try{const j=await api(a,d);if(j.e){toast(j.e);return}if(j.t){TK=j.t;localStorage.setItem("t",TK)}if(j.msg)toast(j.msg);await load()}catch(e){}}
+function auth(){const rg=mode=="reg";return '<h1>🌾 Earn</h1><div class="c" data-f><b>'+(rg?'Create account':'Login')+'</b>'+(rg?'<input name="name" placeholder="Your name">':'')+'<input name="email" type="email" placeholder="Email"><input name="pass" type="password" placeholder="Password">'+
+ '<button class="b" data-a="'+(rg?'reg':'login')+'">'+(rg?'Register':'Login')+'</button><button class="b l" data-a="mode" data-m="'+(rg?'login':'reg')+'">'+(rg?'Have an account? Login':'New here? Register')+'</button></div>'}
+function home(){const u=S.u,c=S.c,tot=c.farm_h*36e5,l=S.fs?S.fs+tot-(Date.now()+off):0;
+ const fm=!S.fs?'<button class="b" data-a="fs">🌱 Start farming</button>':l>0?'<div class="bar"><i id="fb" style="width:'+Math.min(100,(tot-l)/tot*100)+'%"></i></div><p class="m" id="ft">'+fmt(l)+' left</p>':'<button class="b gd" data-a="fh">🌾 Harvest '+money(c.farm_r)+'</button>';
+ return (c.notice?'<div class="c">📢 '+esc(c.notice)+'</div>':'')+'<div class="c"><span class="m">Hi '+esc(u.name)+', your balance</span><div class="big">'+money(u.bal)+'</div></div>'+
+ '<div class="c"><b>Farm</b><p class="m">Harvest '+money(c.farm_r)+' every '+c.farm_h+' hours.</p>'+fm+'</div>'+
+ '<div class="c"><b>Daily check-in</b><p class="m">Streak: '+u.streak+' day(s). Reward grows every day.</p>'+(u.ci?'<button class="b" disabled>Checked in ✓</button>':'<button class="b" data-a="ci">Check in</button>')+'</div>'}
+function tasks(){return '<div class="c"><b>Tasks</b><p class="m">Open the link, wait '+S.c.secs+' seconds, then claim.</p></div>'+(S.tk.map(k=>{const l=k.s?k.s+S.c.secs*1e3-(Date.now()+off):0;
+ const bt=k.d?'<span class="m">Done ✓</span>':!k.s?'<button class="b s" data-a="ts" data-id="'+k.id+'" data-url="'+esc(k.url)+'">Start</button>':l>0?'<span class="m">'+Math.ceil(l/1e3)+'s</span>':'<button class="b gd s" data-a="tc" data-id="'+k.id+'">Claim</button>';
+ return '<div class="c r"><span>'+esc(k.title)+'<br><span class="m">+'+money(k.rw)+'</span></span>'+bt+'</div>'}).join("")||'<div class="c m">No tasks right now. Check back later.</div>')}
+function refer(){const l=location.origin+"/?ref="+S.u.code;return '<div class="c"><b>Invite friends</b><p class="m">You get '+money(S.c.ref)+' when a friend you invite finishes their first harvest.</p><input readonly value="'+esc(l)+'"><button class="b" data-a="cp" data-l="'+esc(l)+'">Copy link</button></div>'+
+ '<div class="c"><b>Your referrals</b><p>Joined: '+S.rc.n+' · Successful: '+S.rc.k+'</p></div>'}
+const KN={farm:"Farm",ci:"Check-in",task:"Task",ref:"Referral",wd:"Withdraw",refund:"Refund",admin:"Admin"};
+const WS={p:"Pending",d:"Paid ✓",r:"Rejected"};
+function wallet(){return '<div class="c"><span class="m">Balance</span><div class="big">'+money(S.u.bal)+'</div></div>'+
+ '<div class="c" data-f><b>Withdraw</b><p class="m">Minimum '+money(S.c.minw)+'. Paid manually by admin.</p><select name="m"><option value="bkash">bKash</option><option value="nagad">Nagad</option><option value="paypal">PayPal</option></select>'+
+ '<input name="ac" placeholder="bKash/Nagad number or PayPal email"><input name="amt" type="number" step="any" placeholder="Amount"><button class="b gd" data-a="wr">Request withdraw</button></div>'+
+ (S.w.length?'<div class="c"><b>Withdraw requests</b>'+S.w.map(w=>'<div class="r"><span>'+w.m+' · '+esc(w.a)+'</span><span>'+money(w.amt)+' · '+WS[w.st]+'</span></div>').join("")+'</div>':'')+
+ '<div class="c"><b>History</b>'+(S.h.map(h=>'<div class="r"><span>'+(KN[h.k]||h.k)+'<br><span class="m">'+new Date(h.ts).toLocaleString()+'</span></span><b class="'+(h.amt>=0?'pl':'mi')+'">'+(h.amt>=0?'+':'')+money(h.amt)+'</b></div>').join("")||'<p class="m">Nothing yet.</p>')+'</div>'+
+ '<button class="b l" data-a="out">Log out</button>'}
+const CF=[["name","Site name"],["cur","Currency symbol"],["farm_h","Farm hours"],["farm_r","Farm reward"],["ci","Check-in rewards (7 values, comma)"],["ref","Referral bonus"],["secs","Task timer (seconds)"],["minw","Minimum withdraw"],["wd","Withdraw open (1 = yes, 0 = no)"],["notice","Notice on home page"]];
+function admin(){if(!AD)return"";let x='<div class="c"><b>Stats</b><p>Users: '+AD.st.n+' · Total user balance: '+money(AD.st.b)+'</p></div>';
+ x+='<div class="c"><b>Withdraw requests</b>'+(AD.w.map(w=>'<div class="r" style="margin:8px 0"><span>'+esc(w.email)+'<br><span class="m">'+w.m+' · '+esc(w.a)+' · '+money(w.amt)+'</span></span><span><button class="b gd s" data-a="adw" data-id="'+w.id+'" data-ok="1">Paid</button> <button class="b x s" data-a="adw" data-id="'+w.id+'" data-ok="">✕</button></span></div>').join("")||'<p class="m">None</p>')+'</div>';
+ x+='<div class="c" data-f><b>Add task</b><input name="title" placeholder="Title"><input name="url" placeholder="https://link"><input name="rw" type="number" step="any" placeholder="Reward"><button class="b" data-a="adt">Add</button></div>';
+ x+='<div class="c"><b>Active tasks</b>'+AD.t.map(t=>'<div class="r" style="margin:8px 0"><span>'+esc(t.title)+' · '+money(t.rw)+'</span><button class="b x s" data-a="adx" data-id="'+t.id+'">✕</button></div>').join("")+'</div>';
+ x+='<div class="c" data-f><b>Find user</b><input name="q" value="'+esc(AQ)+'" placeholder="email or name"><button class="b" data-a="ads">Search</button></div>';
+ x+=AD.us.map(z=>'<div class="c" data-f><b>'+esc(z.name)+'</b> · '+esc(z.email)+'<br>Balance '+money(z.bal)+(z.banned?' · BLOCKED':'')+'<input name="amt" type="number" step="any" placeholder="+ add / - deduct"><button class="b s" data-a="adj" data-id="'+z.id+'">Adjust</button> <button class="b x s" data-a="adb" data-id="'+z.id+'" data-on="'+(z.banned?'':'1')+'">'+(z.banned?'Unblock':'Block')+'</button></div>').join("");
+ x+='<div class="c" data-f><b>Settings</b>'+CF.map(f=>'<label class="m">'+f[1]+'</label><input name="'+f[0]+'" value="'+esc(S.c[f[0]])+'">').join("")+'<button class="b" data-a="adcfg">Save settings</button></div>';return x}
+function render(){if(!S){$("app").innerHTML=auth();$("nav").innerHTML="";return}
+ $("app").innerHTML=({h:home,t:tasks,r:refer,w:wallet,a:admin})[tab]();
+ const tb=[["h","🏠","Home"],["t","✅","Tasks"],["r","👥","Refer"],["w","💰","Wallet"]];if(S.adm)tb.push(["a","⚙️","Admin"]);
+ $("nav").innerHTML=tb.map(t=>'<a data-a="tab" data-t="'+t[0]+'" class="'+(tab==t[0]?'on':'')+'">'+t[1]+'<br>'+t[2]+'</a>').join("")}
+document.onclick=async e=>{const b=e.target.closest("[data-a]");if(!b)return;const d=Object.assign({},b.dataset),a=d.a,F=b.closest("[data-f]");
+ if(F)F.querySelectorAll("input,select").forEach(i=>{if(i.name)d[i.name]=i.value});
+ if(a=="tab"){tab=d.t;if(tab=="a"&&S.adm)await adload();render()}
+ else if(a=="mode"){mode=d.m;render()}
+ else if(a=="out"){TK=null;localStorage.removeItem("t");S=null;render()}
+ else if(a=="cp"){try{await navigator.clipboard.writeText(d.l);toast("Copied ✓")}catch(x){toast(d.l)}}
+ else if(a=="ts"){window.open(d.url,"_blank","noopener");act("ts",{id:d.id})}
+ else if(a=="ads"){await adload(d.q);render()}
+ else{if(a=="reg")d.ref=new URLSearchParams(location.search).get("ref")||"";act(a,d)}};
+setInterval(()=>{if(!S)return;const n=Date.now()+off,c=S.c;
+ if(tab=="h"&&S.fs){const tot=c.farm_h*36e5,l=S.fs+tot-n,ft=$("ft");if(l<=0&&ft){render();return}if(ft){ft.textContent=fmt(l)+" left";$("fb").style.width=Math.min(100,(tot-l)/tot*100)+"%"}}
+ if(tab=="t"&&S.tk.some(k=>k.s&&!k.d&&n-k.s<c.secs*1e3+1e3))render()},1000);
+if(TK)load().catch(()=>render());else render();
+</script></body></html>`;
+
+// =====================================================================
+// DEPLOYMENT
+// 1. D1:       wrangler d1 create earn-db
+//              wrangler.toml:  [[d1_databases]] binding="DB" database_name="earn-db" database_id="<id>"
+//              Tables are created automatically on the first request.
+// 2. Admin:    wrangler.toml:  [vars] ADMIN_EMAIL = "you@example.com"
+//              Register on the site with that email to get the Admin tab.
+// 3. Deploy:   wrangler deploy   -> open https://NAME.SUBDOMAIN.workers.dev
+// NOTE: Withdrawals are NOT sent automatically. Admin pays manually from his own
+//       bKash/Nagad/PayPal and presses "Paid". Reject refunds the balance.
+// =====================================================================
