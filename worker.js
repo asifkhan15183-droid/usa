@@ -1,17 +1,18 @@
 // =====================================================================
-// EARNING APP - standalone web app (no Telegram, no crypto, no mining)
+// EARNING APP + PWA + 21-DAY CHECK-IN + LUCKY SPIN
 // Single-file Cloudflare Worker (frontend + backend) + D1 database
-// Binding: D1 "DB" | Variable: ADMIN_EMAIL (the email that gets the Admin tab)
-// Features: email login, farming, daily check-in, tasks (timer enforced on server),
-// referral bonus, withdraw by bKash / Nagad / PayPal (manual admin payout), admin panel
+// Binding: D1 "DB" | Variable: ADMIN_EMAIL
 // =====================================================================
-const DEF = { name: "EarnBD", cur: "৳", farm_h: 6, farm_r: 0.5, ci: "0.2,0.3,0.4,0.5,0.6,0.8,2", ref: 5, secs: 20, minw: 100, wd: 1, notice: "" };
+const DEF = { name: "EarnBD", cur: "৳", farm_h: 6, farm_r: 0.5,
+  ci: "0.2,0.3,0.4,0.5,0.6,0.8,1,1.2,1.5,1.8,2,2.5,3,3.5,4,4.5,5,6,7,8,10",
+  ref: 5, secs: 20, minw: 100, wd: 1, notice: "",
+  spin: "0.1,0.2,0.5,1,2,5,10,0" };
 const NUM = ["farm_h", "farm_r", "ref", "secs", "minw", "wd"];
 const J = (d, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const r2 = n => Math.round(n * 100) / 100;
 const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
 const rnd = n => hex(crypto.getRandomValues(new Uint8Array(n)));
-const day = t => Math.floor((t + 216e5) / 864e5); // day number in Bangladesh time (UTC+6)
+const day = t => Math.floor((t + 216e5) / 864e5);
 const EM = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 async function hash(p, salt) {
   const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(p), "PBKDF2", false, ["deriveBits"]);
@@ -34,6 +35,7 @@ async function init(db) {
     "CREATE TABLE IF NOT EXISTS hist(id INTEGER PRIMARY KEY AUTOINCREMENT,u INTEGER,k TEXT,amt REAL,ts INTEGER)",
     "CREATE INDEX IF NOT EXISTS hu ON hist(u,id)",
     "CREATE TABLE IF NOT EXISTS wd(id INTEGER PRIMARY KEY AUTOINCREMENT,u INTEGER,m TEXT,a TEXT,amt REAL,st TEXT DEFAULT 'p',ts INTEGER)",
+    "CREATE TABLE IF NOT EXISTS spin(u INTEGER PRIMARY KEY,d INTEGER DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS cfg(k TEXT PRIMARY KEY,v TEXT)"].map(s => db.prepare(s)));
   READY = true;
 }
@@ -88,8 +90,9 @@ async function api(req, env) {
     const h = (await db.prepare("SELECT k,amt,ts FROM hist WHERE u=? ORDER BY id DESC LIMIT 30").bind(u.id).all()).results;
     const w = (await db.prepare("SELECT id,m,a,amt,st,ts FROM wd WHERE u=? ORDER BY id DESC LIMIT 15").bind(u.id).all()).results;
     const rc = await db.prepare("SELECT COUNT(*) n,COALESCE(SUM(refok),0) k FROM users WHERE refby=?").bind(u.id).first();
+    const sp = await db.prepare("SELECT d FROM spin WHERE u=?").bind(u.id).first();
     const dn = day(now);
-    return J({ u: { id: u.id, name: u.name, email: u.email, bal: u.bal, code: u.code, n: u.lci === dn || u.lci === dn - 1 ? u.streak : 0, ci: u.lci === dn }, fs: f ? f.s : 0, now, c, tk, h, w, rc, adm });
+    return J({ u: { id: u.id, name: u.name, email: u.email, bal: u.bal, code: u.code, n: u.lci === dn || u.lci === dn - 1 ? u.streak : 0, ci: u.lci === dn, lci: u.lci, d: dn, spun: !!(sp && sp.d === dn) }, fs: f ? f.s : 0, now, c, tk, h, w, rc, adm });
   }
   if (a === "fs") {
     await db.prepare("INSERT OR IGNORE INTO farm(u,s) VALUES(?,0)").bind(u.id).run();
@@ -99,16 +102,42 @@ async function api(req, env) {
   if (a === "fh") {
     if (!await ch(db.prepare("UPDATE farm SET s=0 WHERE u=? AND s>0 AND s<=?").bind(u.id, now - c.farm_h * 36e5))) return J({ e: "Not ready yet" }, 400);
     await db.batch(credit(db, u.id, c.farm_r, "farm"));
-    // referral bonus: paid once, when the invited user finishes the first harvest
     if (u.refby && !u.refok && await ch(db.prepare("UPDATE users SET refok=1 WHERE id=? AND refok=0").bind(u.id)))
       await db.batch(credit(db, u.refby, c.ref, "ref"));
     return J({ msg: "Harvested +" + c.cur + c.farm_r });
   }
   if (a === "ci") {
-    const d = day(now), st = u.lci === d - 1 ? u.streak + 1 : 1, arr = c.ci.split(",").map(Number), rw = r2(arr[(st - 1) % arr.length] || 0);
-    if (!await ch(db.prepare("UPDATE users SET lci=?,streak=? WHERE id=? AND lci<?").bind(d, st, u.id, d))) return J({ e: "Already checked in today" }, 400);
+    const arr = c.ci.split(",").map(Number).filter(v => isFinite(v) && v > 0);
+    if (!arr.length) return J({ e: "Check-in not configured" }, 400);
+    const DAYS = 21;
+    const rewards = []; for (let i = 0; i < DAYS; i++) rewards.push(arr[i % arr.length]);
+    const d = day(now);
+    if (u.lci === d) return J({ e: "Already checked in today" }, 400);
+    let st = u.lci === d - 1 ? u.streak + 1 : 1;
+    if (st > DAYS) st = 1;
+    const rw = r2(rewards[st - 1] || 0);
+    if (!await ch(db.prepare("UPDATE users SET lci=?,streak=? WHERE id=? AND lci<?").bind(d, st, u.id, d)))
+      return J({ e: "Already checked in today" }, 400);
     await db.batch(credit(db, u.id, rw, "ci"));
-    return J({ msg: "Check-in +" + c.cur + rw });
+    return J({ msg: "Day " + st + " ✓ +" + c.cur + rw });
+  }
+  if (a === "spin") {
+    const d = day(now);
+    const arr = (c.spin || "").split(",").map(Number).filter(v => isFinite(v) && v >= 0);
+    if (!arr.length) return J({ e: "Spin not configured" }, 400);
+    const existing = await db.prepare("SELECT d FROM spin WHERE u=?").bind(u.id).first();
+    if (!existing) {
+      try { await db.prepare("INSERT INTO spin(u,d) VALUES(?,?)").bind(u.id, d).run(); }
+      catch (err) { return J({ e: "Come back tomorrow" }, 400); }
+    } else {
+      if (existing.d === d) return J({ e: "Come back tomorrow" }, 400);
+      const n = await ch(db.prepare("UPDATE spin SET d=? WHERE u=? AND d<>?").bind(d, u.id, d));
+      if (!n) return J({ e: "Come back tomorrow" }, 400);
+    }
+    const idx = Math.floor(Math.random() * arr.length);
+    const rw = r2(arr[idx]);
+    if (rw > 0) await db.batch(credit(db, u.id, rw, "spin"));
+    return J({ msg: rw > 0 ? "You won " + c.cur + rw + "! 🎉" : "Better luck tomorrow!", idx, rw });
   }
   if (a === "ts") {
     const id = Number(b.id);
@@ -166,7 +195,7 @@ async function api(req, env) {
   if (a === "adcfg") {
     for (const k of Object.keys(DEF)) {
       if (b[k] === undefined) continue;
-      let v = String(b[k]).slice(0, 200);
+      let v = String(b[k]).slice(0, 400);
       if (NUM.includes(k)) { v = Number(v); if (!isFinite(v) || v < 0) return J({ e: "Invalid " + k }, 400) }
       await db.prepare("INSERT INTO cfg(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(k, String(v)).run();
     }
@@ -175,10 +204,41 @@ async function api(req, env) {
   return J({ e: "Unknown action" }, 400);
 }
 
+// ---------------------------------------------------------------- PWA assets
+const SW = `const CACHE='spc-v1';
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(['/','/icon.svg','/manifest.json'])));self.skipWaiting()});
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!==CACHE).map(x=>caches.delete(x)))));self.clients.claim()});
+self.addEventListener('fetch',e=>{
+  const u=new URL(e.request.url);
+  if(u.pathname==='/api'||e.request.method!=='GET')return;
+  e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).then(res=>{
+    if(res.ok){const c=res.clone();caches.open(CACHE).then(k=>k.put(e.request,c))}
+    return res
+  }).catch(()=>caches.match('/'))))
+});`;
+
+const MANIFEST = JSON.stringify({
+  name: "SPC Earn", short_name: "SPC",
+  description: "Farm, complete tasks, get paid",
+  start_url: "/", display: "standalone",
+  background_color: "#1A1F2E", theme_color: "#1A1F2E",
+  orientation: "portrait",
+  icons: [
+    { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" },
+    { src: "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "maskable" }
+  ]
+});
+
+const ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="96" fill="#1A1F2E"/><circle cx="256" cy="220" r="150" fill="none" stroke="#4F82FF" stroke-width="6" opacity="0.25"/><g transform="translate(256 220)" fill="none" stroke="#6BA6FF" stroke-width="14" stroke-linecap="round"><circle r="24" fill="#4F82FF" stroke="none"/><path d="M0-24V-100M-24 0H-100M24 0H100M0 24V100M-18-18L-72-72M18-18L72-72M-18 18L-72 72M18 18L72 72"/></g><text x="256" y="430" text-anchor="middle" fill="#E4E8F0" font-family="Arial,sans-serif" font-weight="900" font-size="72">SPC</text></svg>';
+
 export default {
   async fetch(req, env) {
     try {
-      if (new URL(req.url).pathname === "/api" && req.method === "POST") return await api(req, env);
+      const p = new URL(req.url).pathname;
+      if (p === "/api" && req.method === "POST") return await api(req, env);
+      if (p === "/manifest.json") return new Response(MANIFEST, { headers: { "content-type": "application/manifest+json", "cache-control": "public,max-age=3600" } });
+      if (p === "/sw.js") return new Response(SW, { headers: { "content-type": "application/javascript", "cache-control": "no-cache" } });
+      if (p === "/icon.svg") return new Response(ICON, { headers: { "content-type": "image/svg+xml", "cache-control": "public,max-age=86400" } });
       return new Response(HTML, { headers: { "content-type": "text/html;charset=utf-8", "cache-control": "no-store" } });
     } catch (e) { return J({ e: "Server error" }, 500) }
   }
@@ -186,6 +246,9 @@ export default {
 
 // ---------------------------------------------------------------- Frontend
 const HTML = String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#1A1F2E"><title>Earn</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -252,18 +315,37 @@ input,select{width:100%;padding:12px;margin:5px 0;border-radius:12px;border:1px 
 .stat3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:6px 0 12px;text-align:center}.stat3>div{background:var(--bg-soft);border:1px solid var(--border);border-radius:12px;padding:9px 4px}.stat3 span{display:block;color:var(--text-dim);font-size:10px;text-transform:uppercase}.stat3 b{font-size:15px}
 .sg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:4px;background:var(--bg-soft);border:1px solid var(--border);border-radius:14px;padding:4px;margin-bottom:12px}.sg a{padding:10px 0;text-align:center;border-radius:10px;color:var(--text-dim);font-weight:700;font-size:13px;cursor:pointer}.sg a.on{background:linear-gradient(135deg,#4F82FF,#3A63CC);color:#fff}
 .chp{display:inline-block;padding:2px 9px;border-radius:12px;font-size:10px;font-weight:800}.chp.a{background:rgba(74,222,128,.15);color:var(--success)}.chp.p{background:rgba(251,191,36,.15);color:var(--warning)}.chp.x{background:rgba(248,113,113,.15);color:var(--danger)}
-@media(max-width:390px){.hero h1{font-size:26px}.hero-copy{width:66%}.spider-art svg{width:48px;height:48px}.tile strong{font-size:10px}}
+/* CHECK-IN GRID */
+.ck-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;margin:12px 0 14px}
+.ck-d{border:1px solid var(--border);border-radius:10px;padding:7px 2px;text-align:center;font-size:9px;line-height:1.3}
+.ck-d b{font-size:10px;display:block;margin:2px 0}
+.ck-d.ck-c{background:rgba(74,222,128,.12);border-color:rgba(74,222,128,.4)}
+.ck-d.ck-c b{color:var(--success)}
+.ck-d.ck-t{background:rgba(251,191,36,.12);border-color:rgba(251,191,36,.5);animation:pulse 1.5s ease-in-out infinite}
+.ck-d.ck-t b{color:var(--warning)}
+.ck-d.ck-l{opacity:.45}
+/* SPIN */
+.spin-wrap{position:relative;width:min(280px,76vw);height:min(280px,76vw);margin:24px auto 28px}
+.spin-wheel{position:absolute;inset:0;border-radius:50%;box-shadow:0 0 0 8px rgba(79,130,255,.15),0 10px 40px rgba(79,130,255,.4);transition:transform 4.5s cubic-bezier(.17,.67,.2,1);overflow:hidden}
+.spin-wheel::after{content:"";position:absolute;inset:0;border-radius:50%;box-shadow:inset 0 0 40px rgba(0,0,0,.35);pointer-events:none}
+.spin-lbl{position:absolute;transform:translate(-50%,-50%);font-size:12px;font-weight:900;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.7);pointer-events:none;white-space:nowrap;z-index:1}
+.spin-pointer{position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:30px;color:#fff;z-index:2;filter:drop-shadow(0 2px 8px rgba(79,130,255,.8))}
+.spin-btn{margin-top:6px;padding:15px 42px;border-radius:28px;border:0;background:linear-gradient(135deg,#4F82FF,#3A63CC);color:#fff;font-weight:900;font-size:15px;font-family:inherit;cursor:pointer;box-shadow:0 6px 20px rgba(79,130,255,.5);letter-spacing:.5px}
+.spin-btn:active{transform:scale(.95)}
+.spin-btn:disabled{opacity:.5;cursor:default}
+@media(max-width:390px){.hero h1{font-size:26px}.hero-copy{width:66%}.spider-art svg{width:48px;height:48px}.tile strong{font-size:10px}.ck-grid{gap:4px}.ck-d{padding:6px 1px;font-size:8px}.ck-d b{font-size:9px}.spin-lbl{font-size:10px}}
 </style></head><body><div class="bg-glow"><div class="glow glow1"></div><div class="glow glow2"></div><div class="glow glow3"></div></div><div id="app"><p class="m" style="padding:40px;text-align:center">Loading…</p></div><div id="ts"></div><nav id="nav"></nav>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let TK=localStorage.getItem("t"),S=null,tab="h",wsub="w",off=0,AD=null,AQ="",mode="login";
+let TK=localStorage.getItem("t"),S=null,tab="h",wsub="w",off=0,AD=null,AQ="",mode="login",DI=null,wheelRot=0;
 const money=n=>S.c.cur+(+n).toFixed(2);
 const fmt=ms=>{const s=Math.max(0,Math.floor(ms/1e3));return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m "+s%60+"s"};
 const sv=(p,w)=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="'+(w||2)+'" stroke-linecap="round" stroke-linejoin="round">'+p+'</svg>';
 const SPD=sv('<circle cx="12" cy="12" r="2.5"/><path d="M12 9.5V4M9 10l-4-3M15 10l4-3M9.5 12H4M14.5 12H20M9 14l-4 3M15 14l4 3M12 14.5V20"/>',1.8);
 const IC={h:'<path d="M3 10l9-7 9 7v10a2 2 0 01-2 2H5a2 2 0 01-2-2V10z"/>',t:'<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M8 10h8M8 14h5"/>',w:'<rect x="2" y="6" width="20" height="14" rx="3"/><path d="M2 10h20M16 14h2"/>',p:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-7 8-7s8 3 8 7"/>',
- cal:'<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M3 10h18M8 2v4M16 2v4"/>',us:'<circle cx="9" cy="8" r="3"/><path d="M3 20c0-3 3-5 6-5s6 2 6 5M17 11a3 3 0 100-6M21 20c0-2-1.5-3.5-4-4"/>',ck:'<path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/>'};
+ cal:'<rect x="3" y="4" width="18" height="18" rx="3"/><path d="M3 10h18M8 2v4M16 2v4"/>',us:'<circle cx="9" cy="8" r="3"/><path d="M3 20c0-3 3-5 6-5s6 2 6 5M17 11a3 3 0 100-6M21 20c0-2-1.5-3.5-4-4"/>',ck:'<path d="M9 11l3 3 8-8"/><path d="M20 12v6a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h9"/>',
+ spin:'<circle cx="12" cy="12" r="10"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12"/><circle cx="12" cy="12" r="3"/>'};
 function toast(m){const e=$("ts");e.textContent=m;e.className="on";clearTimeout(toast.t);toast.t=setTimeout(()=>{e.className=""},2600)}
 function confetti(el){if(!el)return;const r=el.getBoundingClientRect(),cl=["#4F82FF","#6BA6FF","#4ADE80","#FBBF24","#A8C4FF"];
  for(let i=0;i<22;i++){const c=document.createElement("div");c.className="confetti";c.style.background=cl[i%5];c.style.left=r.left+r.width/2+"px";c.style.top=r.top+r.height/2+"px";document.body.appendChild(c);
@@ -286,20 +368,47 @@ function home(){const u=S.u,c=S.c,tot=c.farm_h*36e5,l=S.fs?S.fs+tot-(Date.now()+
  '<section class="stats fade-in"><div class="stat"><div class="stat-val blue">'+done+'</div><div class="stat-lbl">Tasks Done</div></div><div class="stat"><div class="stat-val">'+u.n+' d</div><div class="stat-lbl">Streak</div></div><div class="stat"><div class="stat-val green">'+S.rc.k+'</div><div class="stat-lbl">Invited</div></div></section>'+
  '<section class="balance fade-in"><div class="bal-top"><small>Your Balance</small></div><div class="amount">'+money(u.bal)+'</div><div class="usd">Minimum withdraw '+money(c.minw)+' · bKash · Nagad · PayPal</div><div class="bal-actions"><button class="primary" data-a="tab" data-t="w">Withdraw</button><button data-a="tab" data-t="r">Invite & Earn</button></div></section>'+
  '<section class="streak fade-in"><div class="streak-icon">🔥</div><div class="streak-text"><b>'+u.n+'-Day Streak!</b><small>'+(k.done?'Come back tomorrow for more':'Claim today bonus +'+money(k.arr[k.cnt]||0))+'</small></div><button class="streak-cta" data-a="ci"'+(k.done?' disabled':'')+'>'+(k.done?'✓ Done':'Claim')+'</button></section>'+
- '<section class="tiles fade-in"><div class="tile" data-a="tab" data-t="t"><div class="tile-icon">'+sv(IC.cal)+'</div><strong>Tasks</strong><small>'+S.tk.filter(t=>!t.d).length+' open</small></div><div class="tile" data-a="tab" data-t="r"><div class="tile-icon">'+sv(IC.us)+'</div><strong>Refer</strong><small>+'+money(c.ref)+'</small></div><div class="tile" data-a="tab" data-t="t">'+(k.done?'':'<div class="badge-dot"></div>')+'<div class="tile-icon">'+sv(IC.ck)+'</div><strong>Check-in</strong><small>'+(k.done?'Done ✓':'Claim')+'</small></div><div class="tile" data-a="tab" data-t="w"><div class="tile-icon">'+sv(IC.w)+'</div><strong>Wallet</strong><small>Withdraw</small></div></section>'+
+ '<section class="tiles fade-in"><div class="tile" data-a="tab" data-t="t"><div class="tile-icon">'+sv(IC.cal)+'</div><strong>Tasks</strong><small>'+S.tk.filter(t=>!t.d).length+' open</small></div><div class="tile" data-a="tab" data-t="c">'+(k.done?'':'<div class="badge-dot"></div>')+'<div class="tile-icon">'+sv(IC.ck)+'</div><strong>Check-in</strong><small>'+(k.done?'Done ✓':'21 days')+'</small></div><div class="tile" data-a="tab" data-t="s">'+(u.spun?'':'<div class="badge-dot"></div>')+'<div class="tile-icon">'+sv(IC.spin)+'</div><strong>Spin</strong><small>'+(u.spun?'Spun ✓':'Win big')+'</small></div><div class="tile" data-a="tab" data-t="r"><div class="tile-icon">'+sv(IC.us)+'</div><strong>Refer</strong><small>+'+money(c.ref)+'</small></div></section>'+
  '<section class="tasks fade-in"><div class="section-head"><h3>🌱 Farming</h3></div><div class="task"><div class="task-icon">'+(ready?'🌾':'🌱')+'</div><div class="task-text"><b>Farm</b><small id="ft">'+(!S.fs?'Plant and harvest every '+c.farm_h+' hours':go?fmt(l)+' left':'Ready to harvest!')+'</small><div class="progress-wrap"><div class="progress-bar" id="fb" style="width:'+pct+'%"></div></div></div><div class="task-right"><div class="reward">+'+money(c.farm_r)+'</div>'+fb+'</div></div></section>'}
-function checkin(){const u=S.u,k=ci(),arr=k.arr,cnt=k.cnt,done=k.done;
- const g=arr.map((v,i)=>{const dn=i<cnt,cur=!done&&i==cnt;return '<div style="border:1px solid '+(cur?'var(--gd)':'var(--ln)')+';border-radius:12px;padding:8px 4px;text-align:center;background:'+(dn?'rgba(74,222,128,.12)':'transparent')+'"><div class="m">Day '+(i+1)+'</div><b style="color:'+(dn?'var(--a)':'var(--gd)')+'">'+money(v)+'</b><div class="m">'+(dn?'✓':cur?'Today':'🔒')+'</div></div>'}).join("");
- return '<div class="c"><b>Daily Check-in</b><p class="m">Streak: '+u.n+' day'+(u.n==1?'':'s')+'. Miss a day and it starts again.</p><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(64px,1fr));gap:6px;margin:10px 0">'+g+'</div>'+(done?'<button class="b" disabled>Checked in today ✓</button>':'<button class="b" data-a="ci">Claim Day '+(cnt+1)+' · +'+money(arr[cnt]||0)+'</button>')+'</div>'}
+function checkin(){const u=S.u,arr=(S.c.ci||"").split(",").map(Number).filter(v=>isFinite(v)&&v>0);
+ if(!arr.length) return '<div class="c"><b>📅 21-Day Check-in</b><p class="m">Not configured.</p></div>';
+ const DAYS=21,rewards=[];for(let i=0;i<DAYS;i++)rewards.push(arr[i%arr.length]);
+ const claimed=u.n||0,checked=u.ci,cycleDone=claimed>=DAYS&&!checked;
+ let todayIdx=-1;if(!checked&&!cycleDone)todayIdx=claimed+1;
+ let grid="";for(let i=1;i<=DAYS;i++){const isC=i<=claimed,isT=i===todayIdx,cls=isC?'ck-c':isT?'ck-t':'ck-l',icon=isC?'✓':isT?'🎁':'🔒';
+  grid+='<div class="ck-d '+cls+'"><div class="m">Day '+i+'</div><b>'+money(rewards[i-1])+'</b><div class="m">'+icon+'</div></div>'}
+ let btn;
+ if(checked)btn='<button class="b" disabled>✓ Checked in today</button>';
+ else if(cycleDone)btn='<button class="b gd" data-a="ci">🎉 Start New Cycle (Day 1)</button>';
+ else btn='<button class="b gd" data-a="ci">Claim Day '+todayIdx+' · +'+money(rewards[todayIdx-1])+'</button>';
+ return '<div class="c"><b style="font-size:17px">📅 21-Day Check-in</b><p class="m">Consecutive: '+(u.n||0)+' day'+((u.n||0)===1?'':'s')+'. Miss a day to reset.</p><div class="ck-grid">'+grid+'</div>'+btn+'</div>'}
 function tasks(){const now=Date.now()+off,T=S.c.secs*1e3;
- return checkin()+'<section class="tasks"><div class="section-head"><h3>⚡ Tasks</h3></div>'+(S.tk.length?S.tk.map(k=>{const l=k.s?k.s+T-now:0,pr=k.d?100:!k.s?0:Math.min(100,(1-l/T)*100);
+ return '<section class="tasks"><div class="section-head"><h3>⚡ Tasks</h3></div>'+(S.tk.length?S.tk.map(k=>{const l=k.s?k.s+T-now:0,pr=k.d?100:!k.s?0:Math.min(100,(1-l/T)*100);
  const bt=k.d?'<button class="start" disabled>✓ Done</button>':!k.s?'<button class="start" data-a="ts" data-id="'+k.id+'" data-url="'+esc(k.url)+'">Start</button>':l>0?'<button class="start" disabled>'+Math.ceil(l/1e3)+'s</button>':'<button class="start gold" data-a="tc" data-id="'+k.id+'">Claim</button>';
  return '<div class="task"><div class="task-icon">🔗</div><div class="task-text"><b>'+esc(k.title)+'</b><small>Open the link, wait '+S.c.secs+'s</small><div class="progress-wrap"><div class="progress-bar" style="width:'+pr+'%"></div></div></div><div class="task-right"><div class="reward">+'+money(k.rw)+'</div>'+bt+'</div></div>'}).join(""):'<div class="task m">No tasks yet. Come back soon.</div>')+'</section>'}
+function spinPage(){const c=S.c,rewards=(c.spin||"0").split(",").map(Number).filter(v=>isFinite(v)&&v>=0);
+ if(!rewards.length)return '<div class="c"><b>🎡 Lucky Spin</b><p class="m">Not configured.</p></div>';
+ const segA=360/rewards.length,colors=['#4F82FF','#6BA6FF','#3A63CC','#4ADE80','#FBBF24','#A8C4FF','#F87171','#2D3A5C'];
+ const stops=rewards.map((r,i)=>colors[i%colors.length]+' '+(i*segA)+'deg '+((i+1)*segA)+'deg').join(',');
+ let labels="";for(let i=0;i<rewards.length;i++){const ang=(-90+(i+0.5)*segA)*Math.PI/180,x=50+Math.cos(ang)*38,y=50+Math.sin(ang)*38;
+  labels+='<span class="spin-lbl" style="left:'+x+'%;top:'+y+'%">'+money(rewards[i])+'</span>'}
+ const spun=S.u.spun;
+ return '<div class="c" style="text-align:center;padding:20px 14px"><b style="font-size:18px">🎡 Lucky Spin</b><p class="m" style="margin-top:6px">'+(spun?'Come back tomorrow for another spin!':'Spin once a day for a chance to win!')+'</p>'+
+ '<div class="spin-wrap"><div class="spin-pointer">▼</div><div class="spin-wheel" id="spinWheel" style="background:conic-gradient('+stops+')">'+labels+'</div></div>'+
+ '<button class="spin-btn" id="spinBtn" data-a="spin"'+(spun?' disabled':'')+'>'+(spun?'✓ Spun Today':'🎯 SPIN NOW')+'</button></div>'}
+async function doSpin(btn){if(!S||S.u.spun||btn.disabled)return;btn.disabled=true;btn.textContent="Spinning...";
+ try{const j=await api("spin");if(j.e){toast(j.e);btn.disabled=false;btn.textContent="🎯 SPIN NOW";return}
+  const rewards=(S.c.spin||"").split(",").map(Number).filter(v=>isFinite(v)&&v>=0);
+  const segA=360/rewards.length,base=j.idx*segA+segA/2,targetMod=(360-base)%360,currentMod=((wheelRot%360)+360)%360;
+  const delta=((targetMod-currentMod)+360)%360;wheelRot+=360*6+delta;
+  const w=$("spinWheel");if(w)w.style.transform="rotate("+wheelRot+"deg)";
+  setTimeout(async()=>{toast(j.rw>0?"🎉 You won "+money(j.rw)+"!":"😅 Better luck tomorrow!");if(j.rw>0)confetti(btn);await load()},4700)
+ }catch(e){if(e!==0)toast("Network error");btn.disabled=false;btn.textContent="🎯 SPIN NOW"}}
 function refer(){const l=location.origin+"/?ref="+S.u.code,c=S.c;
  return '<div class="c"><b>👥 Earn '+money(c.ref)+' per successful referral</b><input readonly value="'+esc(l)+'"><div class="g"><button class="b" data-a="cp" data-l="'+esc(l)+'">Copy link</button><button class="b" data-a="sh" data-l="'+esc(l)+'">Share</button></div></div>'+
  '<div class="c"><div class="stat3"><div><span>Total</span><b>'+S.rc.n+'</b></div><div><span>Pending</span><b>'+(S.rc.n-S.rc.k)+'</b></div><div><span>Successful</span><b>'+S.rc.k+'</b></div></div><div class="r"><span class="m">Referral earnings</span><b>'+money(S.rc.k*c.ref)+'</b></div></div>'+
- '<div class="c"><b>How it works</b><p class="m" style="margin-top:6px">1. Share your link. 2. Your friend registers. 3. Your friend finishes their first harvest. Then the referral is Successful and you get '+money(c.ref)+' once. Until then it stays Pending. Fake or self-referral accounts get nothing.</p></div>'}
-const KN={farm:"Farm",ci:"Check-in",task:"Task",ref:"Referral",wd:"Withdraw",refund:"Refund",admin:"Admin"};
+ '<div class="c"><b>How it works</b><p class="m" style="margin-top:6px">1. Share your link. 2. Your friend registers. 3. Your friend finishes their first harvest. Then you get '+money(c.ref)+' once.</p></div>'}
+const KN={farm:"Farm",ci:"Check-in",task:"Task",ref:"Referral",wd:"Withdraw",refund:"Refund",admin:"Admin",spin:"Spin"};
 const WS={p:'<span class="chp p">PENDING</span>',d:'<span class="chp a">PAID</span>',r:'<span class="chp x">REJECTED</span>'};
 function wallet(){const u=S.u;let x='<section class="balance"><div class="bal-top"><small>Your Balance</small></div><div class="amount">'+money(u.bal)+'</div><div class="usd">'+esc(u.name)+' · minimum withdraw '+money(S.c.minw)+'</div></section>'+
  '<div class="sg">'+[["w","Withdraw"],["h","History"]].map(t=>'<a data-a="ws" data-s="'+t[0]+'" class="'+(wsub==t[0]?'on':'')+'">'+t[1]+'</a>').join("")+'</div>';
@@ -307,9 +416,10 @@ function wallet(){const u=S.u;let x='<section class="balance"><div class="bal-to
  (S.w.length?'<div class="c"><b>Withdraw requests</b>'+S.w.map(w=>'<div class="r" style="border-top:1px solid var(--ln)"><span>'+w.m+' · '+esc(w.a)+'<br><span class="m">'+new Date(w.ts).toLocaleDateString()+'</span></span><span style="text-align:right"><b>'+money(w.amt)+'</b><br>'+WS[w.st]+'</span></div>').join("")+'</div>':'')}
  else x+='<div class="c"><b>Wallet history</b>'+(S.h.map(h=>'<div class="r" style="border-top:1px solid var(--ln)"><span>'+(KN[h.k]||h.k)+'<br><span class="m">'+new Date(h.ts).toLocaleString()+'</span></span><b style="color:'+(h.amt<0?'var(--rd)':'var(--a)')+'">'+(h.amt>=0?'+':'')+money(h.amt)+'</b></div>').join("")||'<p class="m">Nothing yet.</p>')+'</div>';
  return x}
-function profile(){const u=S.u;return '<div class="c" style="text-align:center"><div class="avatar" style="width:64px;height:64px;font-size:26px;margin:0 auto 10px">'+esc((u.name||"?").charAt(0).toUpperCase())+'</div><b style="font-size:18px">'+esc(u.name)+'</b><div class="m">'+esc(u.email)+'</div></div>'+
- '<div class="stat3"><div><span>Balance</span><b>'+money(u.bal)+'</b></div><div><span>Streak</span><b>'+u.n+' d</b></div><div><span>Invited</span><b>'+S.rc.k+'</b></div></div>'+(S.adm?'<button class="b" data-a="tab" data-t="a">🛠 Admin panel</button>':'')+'<button class="b l" data-a="out">Log out</button>'}
-const CF=[["name","Site name"],["cur","Currency symbol"],["farm_h","Farm hours"],["farm_r","Farm reward"],["ci","Check-in rewards (comma separated)"],["ref","Referral bonus"],["secs","Task timer (seconds)"],["minw","Minimum withdraw"],["wd","Withdraw open (1 = yes, 0 = no)"],["notice","Notice on home page"]];
+function profile(){const u=S.u;const instBtn=DI?'<button class="b gd" data-a="install">📲 Install App</button>':'';
+ return '<div class="c" style="text-align:center"><div class="avatar" style="width:64px;height:64px;font-size:26px;margin:0 auto 10px">'+esc((u.name||"?").charAt(0).toUpperCase())+'</div><b style="font-size:18px">'+esc(u.name)+'</b><div class="m">'+esc(u.email)+'</div></div>'+
+ '<div class="stat3"><div><span>Balance</span><b>'+money(u.bal)+'</b></div><div><span>Streak</span><b>'+u.n+' d</b></div><div><span>Invited</span><b>'+S.rc.k+'</b></div></div>'+instBtn+(S.adm?'<button class="b" data-a="tab" data-t="a">🛠 Admin panel</button>':'')+'<button class="b l" data-a="out">Log out</button>'}
+const CF=[["name","Site name"],["cur","Currency symbol"],["farm_h","Farm hours"],["farm_r","Farm reward"],["ci","Check-in rewards (comma separated)"],["ref","Referral bonus"],["secs","Task timer (seconds)"],["minw","Minimum withdraw"],["wd","Withdraw open (1 = yes, 0 = no)"],["notice","Notice on home page"],["spin","Spin rewards (comma separated)"]];
 function admin(){if(!AD)return"";let x='<div class="c"><b>🛠 Admin</b><p class="m">Users: '+AD.st.n+' · Total user balance: '+money(AD.st.b)+'</p></div>';
  x+='<div class="c"><b>Withdraw requests</b>'+(AD.w.map(w=>'<div class="r" style="border-top:1px solid var(--ln)"><span>'+esc(w.email)+'<br><span class="m">'+w.m+' · '+esc(w.a)+' · '+money(w.amt)+'</span></span><span style="display:flex;gap:6px"><button class="b gd" data-a="adw" data-id="'+w.id+'" data-ok="1">Paid</button><button class="b x" data-a="adw" data-id="'+w.id+'" data-ok="">✕</button></span></div>').join("")||'<p class="m">None</p>')+'</div>';
  x+='<div class="c" data-f><b>Add task</b><input name="title" placeholder="Title"><input name="url" placeholder="https://link"><input name="rw" type="number" step="any" placeholder="Reward"><button class="b" data-a="adt">Add</button></div>';
@@ -318,7 +428,7 @@ function admin(){if(!AD)return"";let x='<div class="c"><b>🛠 Admin</b><p class
  x+=AD.us.map(z=>'<div class="c" data-f><b>'+esc(z.name)+'</b> · '+esc(z.email)+'<br><span class="m">Balance '+money(z.bal)+(z.banned?' · BLOCKED':'')+'</span><input name="amt" type="number" step="any" placeholder="+ add / - deduct"><div class="g"><button class="b" data-a="adj" data-id="'+z.id+'">Adjust</button><button class="b x" data-a="adb" data-id="'+z.id+'" data-on="'+(z.banned?'':'1')+'">'+(z.banned?'Unblock':'Block')+'</button></div></div>').join("");
  x+='<div class="c" data-f><b>Settings</b>'+CF.map(f=>'<span class="m">'+f[1]+'</span><input name="'+f[0]+'" value="'+esc(S.c[f[0]])+'">').join("")+'<button class="b" data-a="adcfg">Save settings</button></div>';return x+'<button class="b l" data-a="tab" data-t="p">← Back</button>'}
 function render(){if(!S){$("app").innerHTML=auth();$("nav").innerHTML="";return}
- $("app").innerHTML=head()+({h:home,t:tasks,r:refer,w:wallet,p:profile,a:admin})[tab]();
+ $("app").innerHTML=head()+({h:home,t:tasks,c:checkin,s:spinPage,r:refer,w:wallet,p:profile,a:admin})[tab]();
  const ni=(t,n)=>'<div class="navitem'+((tab==t||(t=="p"&&tab=="a"))?' active':'')+'" data-a="tab" data-t="'+t+'">'+sv(IC[t])+n+'</div>';
  $("nav").innerHTML=ni("h","Home")+ni("t","Tasks")+'<div class="nav-spider" data-a="tab" data-t="r">'+sv('<circle cx="12" cy="12" r="2.8"/><path d="M12 9.2V4M9.2 10L5 7M14.8 10L19 7M9.5 12H4M14.5 12H20M9.2 14L5 17M14.8 14L19 17M12 14.8V20" stroke-width="1.6"/>')+'</div>'+ni("w","Wallet")+ni("p","Profile")}
 document.onclick=async e=>{const b=e.target.closest("[data-a]");if(!b)return;const d=Object.assign({},b.dataset),a=d.a,F=b.closest("[data-f]");
@@ -329,23 +439,24 @@ document.onclick=async e=>{const b=e.target.closest("[data-a]");if(!b)return;con
  else if(a=="out"){TK=null;localStorage.removeItem("t");S=null;tab="h";render()}
  else if(a=="cp"){try{await navigator.clipboard.writeText(d.l);toast("Copied ✓")}catch(x){toast(d.l)}}
  else if(a=="sh"){if(navigator.share)navigator.share({text:"Join and earn: "+d.l}).catch(()=>{});else{try{await navigator.clipboard.writeText(d.l);toast("Copied ✓")}catch(x){toast(d.l)}}}
- else if(a=="ts"){window.open(d.url,"_blank","noopener");act("ts",{id:d.id})}
+ else if(a=="ts"){const w=window.open(d.url,"_blank","noopener");if(w)act("ts",{id:d.id});else toast("Popup blocked — allow popups")}
  else if(a=="ads"){await adload(d.q);render()}
+ else if(a=="install"){if(DI){DI.prompt();DI.userChoice.then(c=>{if(c.outcome==="accepted")toast("Installed! 🎉");DI=null;render()})}}
+ else if(a=="spin"){doSpin(b)}
  else{if(a=="reg")d.ref=new URLSearchParams(location.search).get("ref")||"";act(a,d,b)}};
 setInterval(()=>{if(!S)return;const n=Date.now()+off,c=S.c;
  if(tab=="h"&&S.fs){const tot=c.farm_h*36e5,l=S.fs+tot-n,ft=$("ft");if(l<=0&&ft&&ft.textContent.indexOf("Ready")<0){render();return}if(l>0&&ft){ft.textContent=fmt(l)+" left";$("fb").style.width=Math.min(100,(tot-l)/tot*100)+"%"}}
  if(tab=="t"&&S.tk.some(k=>k.s&&!k.d&&n-k.s<c.secs*1e3+1e3))render()},1000);
+window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();DI=e;if(S&&tab==="p")render()});
+if("serviceWorker" in navigator){window.addEventListener("load",()=>{navigator.serviceWorker.register("/sw.js").catch(()=>{})})}
 if(TK)load().catch(()=>render());else render();
 </script></body></html>`;
 
 // =====================================================================
-// DEPLOYMENT
-// 1. D1:       wrangler d1 create earn-db
-//              wrangler.toml:  [[d1_databases]] binding="DB" database_name="earn-db" database_id="<id>"
-//              Tables are created automatically on the first request.
-// 2. Admin:    wrangler.toml:  [vars] ADMIN_EMAIL = "you@example.com"
-//              Register on the site with that email to get the Admin tab.
-// 3. Deploy:   wrangler deploy   -> open https://NAME.SUBDOMAIN.workers.dev
-// NOTE: Withdrawals are NOT sent automatically. Admin pays manually from his own
-//       bKash/Nagad/PayPal and presses "Paid". Reject refunds the balance.
+// DEPLOYMENT (unchanged from before) + PWA notes:
+// - manifest.json, sw.js, icon.svg are auto-served by this Worker
+// - "Install App" button appears on Profile page when PWA is installable
+// - Service worker caches shell + icons, never /api
+// - 21-day check-in: config key "ci" = 21 comma-separated rewards
+// - Lucky spin: config key "spin" = comma-separated segments (last can be 0)
 // =====================================================================
